@@ -6,14 +6,14 @@ import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { z } from "zod";
 
-const configDir = join(homedir(), ".config", "ohm-mem");
+const configDir = join(homedir(), ".config", "cf-graphiti");
 const defaultProfile = "default";
 const timeoutMs = 300_000;
 const kinds = ["message", "transcript", "note", "document", "record"] as const;
 
-const usage = `ohm-mem: query and write the cf-graphiti memory graph
+const usage = `cf-graphiti: query and write a cf-graphiti memory graph
 
-Usage: ohm-mem <command> [args] [--profile p] [--json]
+Usage: cf-graphiti <command> [args] [--profile p] [--json]
 
 Commands
   search <query...> [--recipe r] [--limit n] [--center entity-id] [--origins id,id]
@@ -35,11 +35,11 @@ Commands
   drop-fact <fact-id>                                    delete one fact
 
 Global
-  --profile p   memory profile (default $OHM_MEM_PROFILE, ~/.config/ohm-mem/profile or ${defaultProfile})
+  --profile p   memory profile (default $CF_GRAPHITI_PROFILE, ~/.config/cf-graphiti/profile or ${defaultProfile})
   --json        print the raw API response
-  --url u       API base (default $OHM_MEM_URL or ~/.config/ohm-mem/url)
+  --url u       API base (default $CF_GRAPHITI_URL or ~/.config/cf-graphiti/url)
 
-Auth: $OHM_MEM_TOKEN, else ~/.config/ohm-mem/token.
+Auth: $CF_GRAPHITI_TOKEN, else ~/.config/cf-graphiti/token.
 `;
 
 const options = {
@@ -166,17 +166,17 @@ function configFile(name: string): string | undefined {
 }
 
 function token(): string {
-  const value = process.env.OHM_MEM_TOKEN?.trim() || configFile("token");
+  const value = process.env.CF_GRAPHITI_TOKEN?.trim() || configFile("token");
   if (value === undefined) {
-    throw new Error("no token: set OHM_MEM_TOKEN or write ~/.config/ohm-mem/token");
+    throw new Error("no token: set CF_GRAPHITI_TOKEN or write ~/.config/cf-graphiti/token");
   }
   return value;
 }
 
 function apiBase(flag: string | undefined): string {
-  const value = flag ?? process.env.OHM_MEM_URL ?? configFile("url");
+  const value = flag ?? process.env.CF_GRAPHITI_URL ?? configFile("url");
   if (value === undefined) {
-    throw new UsageError("no API base: pass --url, set OHM_MEM_URL or write ~/.config/ohm-mem/url");
+    throw new UsageError("no API base: pass --url, set CF_GRAPHITI_URL or write ~/.config/cf-graphiti/url");
   }
   return value.replace(/\/+$/, "");
 }
@@ -190,7 +190,7 @@ async function request<Schema extends z.ZodType>(
 ): Promise<{ raw: unknown; data: z.output<Schema> }> {
   const response = await fetch(`${context.base}${context.prefix}${path}`, {
     method,
-    headers: { authorization: `Bearer ${token()}`, "content-type": "application/json", "user-agent": "ohm-mem" },
+    headers: { authorization: `Bearer ${token()}`, "content-type": "application/json", "user-agent": "cf-graphiti" },
     body: body === undefined ? undefined : JSON.stringify(body),
     signal: AbortSignal.timeout(timeoutMs),
   });
@@ -396,7 +396,7 @@ async function main(argv: string[]): Promise<number> {
   }
   const context: Context = {
     base: apiBase(flags.url),
-    prefix: `/profiles/${encodeURIComponent(flags.profile ?? process.env.OHM_MEM_PROFILE ?? configFile("profile") ?? defaultProfile)}`,
+    prefix: `/profiles/${encodeURIComponent(flags.profile ?? process.env.CF_GRAPHITI_PROFILE ?? configFile("profile") ?? defaultProfile)}`,
     json: flags.json === true,
   };
   const commands: Record<string, () => Promise<void>> = {
@@ -419,6 +419,6 @@ async function main(argv: string[]): Promise<number> {
 try {
   process.exitCode = await main(process.argv.slice(2));
 } catch (error) {
-  process.stderr.write(`ohm-mem: ${error instanceof Error ? error.message : String(error)}\n`);
+  process.stderr.write(`cf-graphiti: ${error instanceof Error ? error.message : String(error)}\n`);
   process.exitCode = error instanceof UsageError ? 2 : 1;
 }

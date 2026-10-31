@@ -8,7 +8,7 @@ You send it events: emails, notes, transcripts, CRM records. An LLM extracts ent
 
 ```mermaid
 flowchart LR
-  cli["ohm-mem CLI<br/>(Bun)"] -- "Bearer API_TOKEN" --> worker
+  cli["cf-graphiti CLI<br/>(Bun)"] -- "Bearer API_TOKEN" --> worker
   client["any HTTP client"] -- "Bearer API_TOKEN" --> worker
 
   subgraph cf["Cloudflare"]
@@ -30,7 +30,7 @@ flowchart LR
 | Search | `src/search.ts`, `src/fts.ts` | Graphiti `search_` with all of its recipes and rerankers |
 | Prompts | `src/prompts.ts`, `src/ontology.ts`, `src/pyformat.ts` | Graphiti prompts and response schemas, entity types, Python-compatible timestamp formatting |
 | LLM | `src/llm.ts` | Workers AI calls with a concurrency limit, rate-limit backoff and schema-repair retries |
-| CLI | `cli/ohm-mem.ts` | Command-line client for the HTTP API |
+| CLI | `cli/cf-graphiti.ts` | Command-line client for the HTTP API |
 
 Models (`src/llm.ts`):
 
@@ -102,7 +102,7 @@ There are three timestamps on a fact:
 | `invalid_at` | When it stopped being true |
 | `expired_at` | When the graph learned it was no longer current |
 
-`GET /graph` and `ohm-mem graph` hide facts with an `expired_at` unless you ask for them. Search does not filter them, matching Graphiti; check `expiredAt` on each result.
+`GET /graph` and `cf-graphiti graph` hide facts with an `expired_at` unless you ask for them. Search does not filter them, matching Graphiti; check `expiredAt` on each result.
 
 ## Writing: `POST /remember`
 
@@ -259,26 +259,26 @@ All routes except `/health` require `Authorization: Bearer $API_TOKEN`. A profil
 | `DELETE` | `/profiles/:profile/episodes/:id` | Remove an episode |
 | `DELETE` | `/profiles/:profile/facts/:id` | Remove a fact |
 
-## CLI: `ohm-mem`
+## CLI: `cf-graphiti`
 
 ```sh
-bun cli/ohm-mem.ts remember "Alice moved to the Pro plan" --participant "Alice Smith:customer"
-bun cli/ohm-mem.ts remember --file notes/call.md --kind transcript --at 2026-10-30T09:00:00Z
-bun cli/ohm-mem.ts search "what plan is Alice on"
-bun cli/ohm-mem.ts graph "Alice Smith" --all
-bun cli/ohm-mem.ts status
-bun cli/ohm-mem.ts forget <episode-id>
+bun cli/cf-graphiti.ts remember "Alice moved to the Pro plan" --participant "Alice Smith:customer"
+bun cli/cf-graphiti.ts remember --file notes/call.md --kind transcript --at 2026-10-30T09:00:00Z
+bun cli/cf-graphiti.ts search "what plan is Alice on"
+bun cli/cf-graphiti.ts graph "Alice Smith" --all
+bun cli/cf-graphiti.ts status
+bun cli/cf-graphiti.ts forget <episode-id>
 ```
 
-Each setting comes from the flag, then the environment variable, then a file in `~/.config/ohm-mem/`.
+Each setting comes from the flag, then the environment variable, then a file in `~/.config/cf-graphiti/`.
 
 | Setting | Flag | Environment | File | Default |
 |---|---|---|---|---|
-| API base | `--url` | `OHM_MEM_URL` | `url` | none, required |
-| Profile | `--profile` | `OHM_MEM_PROFILE` | `profile` | `default` |
-| Token | | `OHM_MEM_TOKEN` | `token` | none, required |
+| API base | `--url` | `CF_GRAPHITI_URL` | `url` | none, required |
+| Profile | `--profile` | `CF_GRAPHITI_PROFILE` | `profile` | `default` |
+| Token | | `CF_GRAPHITI_TOKEN` | `token` | none, required |
 
-Add `--json` to any command to print the raw API response. Run `ohm-mem --help` for every flag.
+Add `--json` to any command to print the raw API response. Run `cf-graphiti --help` for every flag.
 
 ## Development
 
