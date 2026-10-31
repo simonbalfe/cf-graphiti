@@ -1,0 +1,18 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cf-graphiti",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-24",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "observability": { "enabled": true },
+  "ai": { "binding": "AI", "remote": true },
+  "durable_objects": {
+    "bindings": [{ "name": "GRAPH", "class_name": "MemoryGraph" }]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["MemoryWriter"] },
+    { "tag": "v2", "renamed_classes": [{ "from": "MemoryWriter", "to": "MemoryGraph" }] }
+  ],
+  "secrets": { "required": ["API_TOKEN"] }
+}

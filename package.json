@@ -1,0 +1,21 @@
+{
+  "name": "cf-graphiti",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "types": "wrangler types",
+    "check": "wrangler types && tsc --noEmit && tsc --noEmit -p cli"
+  },
+  "dependencies": {
+    "hono": "4.13.13",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.4",
+    "typescript": "6.0.3",
+    "wrangler": "4.152.0"
+  }
+}
