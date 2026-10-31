@@ -1,4 +1,3 @@
-import { cosine } from "./llm";
 import { migrations } from "./schema";
 
 export type Row = Record<string, SqlStorageValue>;
@@ -23,6 +22,20 @@ export function idList(ids: readonly string[]): string {
 
 export function vectorBlob(values: readonly number[] | null): ArrayBuffer | null {
   return values === null ? null : new Float32Array(values).buffer;
+}
+
+function normalizedCosine(left: ArrayLike<number>, right: ArrayLike<number>): number | null {
+  let dot = 0;
+  let leftNorm = 0;
+  let rightNorm = 0;
+  for (let index = 0; index < left.length; index += 1) {
+    const a = left[index] ?? 0;
+    const b = right[index] ?? 0;
+    dot += a * b;
+    leftNorm += a * a;
+    rightNorm += b * b;
+  }
+  return leftNorm === 0 || rightNorm === 0 ? null : (1 + dot / Math.sqrt(leftNorm * rightNorm)) / 2;
 }
 
 export class Store {
@@ -78,8 +91,8 @@ export class Store {
       if (allowed !== undefined && !allowed.has(id)) {
         continue;
       }
-      const score = (1 + cosine(query, vector)) / 2;
-      if (score > minScore) {
+      const score = normalizedCosine(query, vector);
+      if (score !== null && score > minScore) {
         scored.push({ id, score });
       }
     }

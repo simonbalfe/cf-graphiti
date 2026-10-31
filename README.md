@@ -224,6 +224,25 @@ Vector search is a brute-force scan over an in-memory cache, which fits one prof
 
 `DELETE /facts/:id` deletes a single fact.
 
+## Parity with Graphiti
+
+The ingest, search and forget paths follow [`graphiti_core`](https://github.com/getzep/graphiti/tree/main/graphiti_core) at commit `72b5c59` (2026-10-28) line by line: prompts render byte-for-byte the same, and constants, thresholds, call order, MinHash (BLAKE2b) dedup, temporal invalidation, summary rules, search recipes and rerankers match. Upstream quirks are kept on purpose, including invalidation candidates searched across the whole graph and expired facts returned by search.
+
+Out of scope: sagas, communities, bulk ingest, `add_triplet`, custom edge types, and entity attribute extraction (the ontology types have no fields).
+
+Deviations Cloudflare forces:
+
+| Area | Upstream | Here |
+|---|---|---|
+| Graph store | Neo4j, Cypher, Lucene fulltext | Durable Object SQLite, FTS5 `unicode61` + `bm25()`, brute-force cosine over cached Float32 vectors. Some tokens split differently (`don't`, `3.14`) |
+| Models | OpenAI chat with small/medium sizes, `text-embedding-3-small` | One Workers AI chat model for every call, `embeddinggemma-300m` |
+| Cross-encoder | OpenAI yes/no reranker using logprobs | `bge-reranker-base`, passages cut to 2,000 characters |
+| Rate limits | SDK retries twice | Retries 4 times (2, 5, 12, 25 s); at most 3 concurrent AI calls per isolate; embeddings in batches of 100 |
+| Error types | Typed OpenAI exceptions | Workers AI error messages matched by text |
+| `group_id` | Filters every query | One Durable Object per profile, so a profile is one group |
+| Previous episodes | Only saved episodes exist | Episodes are stored before extraction, so the lookup skips unextracted episodes and the current one |
+| Timestamps | Python datetimes, microseconds | ISO strings, milliseconds |
+
 ## HTTP API
 
 All routes except `/health` require `Authorization: Bearer $API_TOKEN`. A profile name is 1 to 64 lowercase letters, digits and dashes. Each profile is a separate graph.
@@ -279,6 +298,6 @@ bunx wrangler secret put API_TOKEN
 bun run deploy
 ```
 
-`wrangler.jsonc` has no `account_id`. Wrangler uses the logged-in account, or `CLOUDFLARE_ACCOUNT_ID` if set.
+`wrangler.jsonc` has no `account_id`. Wrangler uses the logged-in account; if the login has more than one, set `CLOUDFLARE_ACCOUNT_ID`.
 
 Schema changes go in `src/schema.ts` as a new entry in `migrations`. Each Durable Object stores its schema version and applies any missing migrations on startup.

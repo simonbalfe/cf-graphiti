@@ -187,12 +187,13 @@ export function saveEdge(edge: EntityEdge): Write[] {
       edge.expiredAt,
       edge.createdAt,
     ],
+    ["DELETE FROM fact_episodes WHERE fact_id = ?", edge.id],
     ...edge.episodes.map(
       (episodeId): Write => ["INSERT INTO fact_episodes (fact_id, memory_id) VALUES (?, ?) ON CONFLICT DO NOTHING", edge.id, episodeId],
     ),
   ];
 }
 
-export function saveMention(episodeId: string, entityId: string): Write {
-  return ["INSERT INTO episode_entities (memory_id, entity_id) VALUES (?, ?) ON CONFLICT DO NOTHING", episodeId, entityId];
+export function saveMention(episodeId: string, entityId: string, createdAt: string): Write {
+  return ["INSERT INTO episode_entities (id, memory_id, entity_id, created_at) VALUES (?, ?, ?, ?)", crypto.randomUUID(), episodeId, entityId, createdAt];
 }

@@ -7,16 +7,26 @@ export const rerankModel = "@cf/baai/bge-reranker-base";
 export const defaultMaxTokens = 16384;
 const temperature = 1;
 const maxApplicationRetries = 2;
+const transportRetries = 2;
+const embeddingDim = 1024;
 const embedBatch = 100;
 const rerankChars = 2000;
 const maxConcurrentCalls = 3;
 const retryDelaysMs = [2_000, 5_000, 12_000, 25_000];
+const zeroWidth = /[\u200b\u200c\u200d\ufeff\u2060]/g;
+const loneSurrogate = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
+const controlCharacters = /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g;
+const transportFailure = /\b5\d\d\b|timed out|timeout|network|connection|internal server/i;
 const extractionLanguageInstruction =
   "\n\nAny extracted information should be returned in the same language as it was written in. " +
   "Only output non-English text when the user has written full sentences or phrases in that non-English language. " +
   "Otherwise, output English.";
 
 export class RateLimitedError extends Error {}
+
+export class RefusalError extends Error {}
+
+class TransportError extends Error {}
 
 export function isRateLimit(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
@@ -48,29 +58,30 @@ async function withSlot<T>(task: () => Promise<T>): Promise<T> {
 }
 
 async function runAi<T>(task: () => Promise<T>): Promise<T> {
+  let transportAttempt = 0;
   for (let attempt = 0; ; attempt += 1) {
     try {
       return await withSlot(task);
     } catch (error) {
-      const wait = retryDelaysMs[attempt];
-      if (!isRateLimit(error)) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (isRateLimit(error)) {
+        const wait = retryDelaysMs[attempt];
+        if (wait === undefined) {
+          throw new RateLimitedError(message);
+        }
+        await delay(wait + Math.random() * 1_000);
+        continue;
+      }
+      if (!transportFailure.test(message)) {
         throw error;
       }
-      if (wait === undefined) {
-        throw new RateLimitedError(error instanceof Error ? error.message : String(error));
+      if (transportAttempt >= transportRetries) {
+        throw new TransportError(message);
       }
-      await delay(wait + Math.random() * 1_000);
+      await delay(Math.min(500 * 2 ** transportAttempt, 8_000) * (1 - 0.25 * Math.random()));
+      transportAttempt += 1;
     }
   }
-}
-
-function parseJson(response: unknown): unknown {
-  if (typeof response !== "string") {
-    return response;
-  }
-  const start = response.indexOf("{");
-  const end = response.lastIndexOf("}");
-  return start === -1 || end < start ? null : JSON.parse(response.slice(start, end + 1));
 }
 
 async function completeOnce<Schema extends z.ZodType>(
@@ -82,13 +93,28 @@ async function completeOnce<Schema extends z.ZodType>(
   const output = await runAi(() =>
     ai.run(graphModel, {
       messages: messages.map((message) => ({ role: message.role, content: message.content })),
-      response_format: { type: "json_schema", json_schema: { name: "output", schema: model.jsonSchema } },
+      response_format: { type: "json_schema", json_schema: { name: model.name, schema: model.jsonSchema, strict: true } },
       chat_template_kwargs: { enable_thinking: false },
+      reasoning_effort: "none",
       temperature,
       max_completion_tokens: maxTokens,
     }),
   );
-  return model.schema.parse(parseJson(output.choices[0]?.message.content));
+  const choice = output.choices[0];
+  if (choice?.finish_reason === "length") {
+    throw new Error(`Output length exceeded max tokens ${defaultMaxTokens}: ${choice.message.content ?? ""}`);
+  }
+  const content: unknown = choice?.message.content;
+  if (content !== null && typeof content === "object") {
+    return model.schema.parse(content);
+  }
+  if (typeof content === "string" && content !== "") {
+    return model.schema.parse(JSON.parse(content));
+  }
+  if (choice?.message.refusal) {
+    throw new RefusalError(choice.message.refusal);
+  }
+  throw new Error(`Invalid response from LLM: ${JSON.stringify(output)}`);
 }
 
 export async function generateResponse<Schema extends z.ZodType>(
@@ -101,10 +127,18 @@ export async function generateResponse<Schema extends z.ZodType>(
     index === 0 ? { ...message, content: message.content + extractionLanguageInstruction } : { ...message },
   );
   for (let retry = 0; ; retry += 1) {
+    for (const message of messages) {
+      message.content = message.content.replace(loneSurrogate, "").replace(zeroWidth, "").replace(controlCharacters, "");
+    }
     try {
       return await completeOnce(ai, messages, model, maxTokens);
     } catch (error) {
-      if (isRateLimit(error) || retry >= maxApplicationRetries) {
+      if (
+        error instanceof RateLimitedError ||
+        error instanceof RefusalError ||
+        error instanceof TransportError ||
+        retry >= maxApplicationRetries
+      ) {
         throw error;
       }
       const name = error instanceof Error ? error.constructor.name : "Error";
@@ -127,17 +161,18 @@ export async function createBatch(ai: Ai, texts: readonly string[]): Promise<num
     if (data.length !== group.length) {
       throw new Error(`${embeddingModel} returned ${data.length} vectors for ${group.length} inputs`);
     }
-    vectors.push(...data);
+    vectors.push(...data.map((vector) => vector.slice(0, embeddingDim)));
   }
   return vectors;
 }
 
 export async function create(ai: Ai, text: string): Promise<number[]> {
-  const [vector] = await createBatch(ai, [text]);
+  const { data } = await runAi(() => ai.run(embeddingModel, { text: [text] }));
+  const [vector] = data;
   if (vector === undefined) {
     throw new Error(`${embeddingModel} returned no vector`);
   }
-  return vector;
+  return vector.slice(0, embeddingDim);
 }
 
 export async function rank(ai: Ai, query: string, passages: readonly string[]): Promise<[string, number][]> {
@@ -154,18 +189,4 @@ export async function rank(ai: Ai, query: string, passages: readonly string[]): 
   return passages
     .map((passage, index): [string, number] => [passage, scores.get(index) ?? 0])
     .sort((left, right) => right[1] - left[1]);
-}
-
-export function cosine(left: ArrayLike<number>, right: ArrayLike<number>): number {
-  let dot = 0;
-  let leftNorm = 0;
-  let rightNorm = 0;
-  for (let index = 0; index < left.length; index += 1) {
-    const a = left[index] ?? 0;
-    const b = right[index] ?? 0;
-    dot += a * b;
-    leftNorm += a * a;
-    rightNorm += b * b;
-  }
-  return leftNorm === 0 || rightNorm === 0 ? 0 : dot / Math.sqrt(leftNorm * rightNorm);
 }

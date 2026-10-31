@@ -9,12 +9,39 @@ export interface Message {
 }
 
 export interface ResponseModel<Schema extends z.ZodType> {
+  name: string;
   schema: Schema;
   jsonSchema: Record<string, unknown>;
 }
 
-function responseModel<Schema extends z.ZodType>(schema: Schema): ResponseModel<Schema> {
-  return { schema, jsonSchema: z.toJSONSchema(schema, { io: "input" }) };
+function strictJsonSchema(node: unknown): unknown {
+  if (Array.isArray(node)) {
+    return node.map(strictJsonSchema);
+  }
+  if (node === null || typeof node !== "object") {
+    return node;
+  }
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(node)) {
+    if (key === "$schema" || key === "default") {
+      continue;
+    }
+    if ((key === "minimum" || key === "maximum") && Math.abs(Number(value)) === Number.MAX_SAFE_INTEGER) {
+      continue;
+    }
+    out[key] = strictJsonSchema(value);
+  }
+  const properties = out["properties"];
+  if (out["type"] === "object" && properties !== null && typeof properties === "object") {
+    out["additionalProperties"] = false;
+    out["required"] = Object.keys(properties);
+  }
+  return out;
+}
+
+function responseModel<Schema extends z.ZodType>(name: string, schema: Schema): ResponseModel<Schema> {
+  const jsonSchema = strictJsonSchema(z.toJSONSchema(schema, { io: "input" }));
+  return { name, schema, jsonSchema: jsonSchema !== null && typeof jsonSchema === "object" ? { ...jsonSchema } : {} };
 }
 
 export interface PreviousEpisode {
@@ -70,6 +97,7 @@ export interface SummariesContext {
 }
 
 export const extractedEntities = responseModel(
+  "ExtractedEntities",
   z.object({
     extracted_entities: z
       .array(
@@ -92,6 +120,7 @@ export const extractedEntities = responseModel(
 );
 
 export const nodeResolutions = responseModel(
+  "NodeResolutions",
   z.object({
     entity_resolutions: z
       .array(
@@ -113,6 +142,7 @@ export const nodeResolutions = responseModel(
 );
 
 export const extractedEdges = responseModel(
+  "ExtractedEdges",
   z.object({
     edges: z.array(
       z.object({
@@ -152,6 +182,7 @@ export const extractedEdges = responseModel(
 );
 
 export const edgeTimestamps = responseModel(
+  "EdgeTimestamps",
   z
     .object({
       valid_at: z
@@ -173,6 +204,7 @@ export const edgeTimestamps = responseModel(
 );
 
 export const edgeDuplicate = responseModel(
+  "EdgeDuplicate",
   z.object({
     duplicate_facts: z
       .array(z.number().int())
@@ -184,6 +216,7 @@ export const edgeDuplicate = responseModel(
 );
 
 export const summarizedEntities = responseModel(
+  "SummarizedEntities",
   z.object({
     summaries: z
       .array(

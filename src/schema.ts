@@ -207,4 +207,20 @@ DELETE FROM jobs;
 INSERT INTO jobs (episode_id, next_at) SELECT id, row_number() OVER (ORDER BY reference_at, created_at) FROM memories;
 `;
 
-export const migrations: readonly string[] = [graphTables, graphitiGraph];
+const episodicMentionEdges = `
+CREATE TABLE episode_entities_next (
+  id TEXT PRIMARY KEY NOT NULL,
+  memory_id TEXT NOT NULL REFERENCES memories (id) ON DELETE CASCADE,
+  entity_id TEXT NOT NULL REFERENCES entities (id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL
+);
+INSERT INTO episode_entities_next (id, memory_id, entity_id, created_at)
+  SELECT lower(hex(randomblob(16))), episode_entities.memory_id, episode_entities.entity_id, coalesce(memories.extracted_at, memories.created_at)
+  FROM episode_entities JOIN memories ON memories.id = episode_entities.memory_id;
+DROP TABLE episode_entities;
+ALTER TABLE episode_entities_next RENAME TO episode_entities;
+CREATE INDEX episode_entities_by_entity ON episode_entities (entity_id);
+CREATE INDEX episode_entities_by_memory ON episode_entities (memory_id);
+`;
+
+export const migrations: readonly string[] = [graphTables, graphitiGraph, episodicMentionEdges];

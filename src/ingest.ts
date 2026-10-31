@@ -1,5 +1,5 @@
 import { buildCandidateIndexes, normalizeStringExact, promoteResolvedNode, resolveWithSimilarity } from "./dedup";
-import { createBatch, generateResponse, isRateLimit } from "./llm";
+import { createBatch, generateResponse } from "./llm";
 import {
   type EntityEdge,
   type EntityNode,
@@ -44,6 +44,8 @@ const nodeDedupCandidateLimit = 15;
 const nodeDedupCosineMinScore = 0.6;
 const maxNodesPerSummaryCall = 30;
 const summaryRebuildBatchSize = 10;
+const semaphoreLimit = 20;
+const dedupeCandidateSummaryChars = 120;
 const defaultEntityTypeDescription =
   "A specific, identifiable entity that does not fit any of the other listed types. Must still be a concrete, meaningful thing — " +
   "specific enough to be uniquely identifiable. GOOD: a named entity not covered by the other types. " +
@@ -96,16 +98,55 @@ function concatenateEpisodes(episodes: readonly EpisodicNode[]): string {
 }
 
 function truncateAtSentence(text: string, maxChars: number): string {
-  if (text === "" || text.length <= maxChars) {
+  const characters = [...text];
+  if (text === "" || characters.length <= maxChars) {
     return text;
   }
-  const truncated = text.slice(0, maxChars);
+  const truncated = characters.slice(0, maxChars).join("");
   const last = [...truncated.matchAll(/[.!?](?:\s|$)/g)].at(-1);
   return last === undefined ? truncated.trimEnd() : text.slice(0, last.index + last[0].length).trimEnd();
 }
 
 function uniqueById<T extends { id: string }>(items: readonly T[]): T[] {
-  return [...new Map(items.map((item) => [item.id, item])).values()];
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    if (seen.has(item.id)) {
+      return false;
+    }
+    seen.add(item.id);
+    return true;
+  });
+}
+
+async function semaphoreGather<T>(tasks: readonly (() => Promise<T>)[]): Promise<T[]> {
+  const results = new Array<T>(tasks.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < tasks.length) {
+      const index = next;
+      next += 1;
+      const task = tasks[index];
+      if (task !== undefined) {
+        results[index] = await task();
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(semaphoreLimit, tasks.length) }, worker));
+  return results;
+}
+
+async function embedFacts(ai: Ai, edges: readonly EntityEdge[]): Promise<void> {
+  const withFacts = edges.filter((edge) => edge.fact !== "");
+  if (withFacts.length === 0) {
+    return;
+  }
+  const vectors = await createBatch(
+    ai,
+    withFacts.map((edge) => edge.fact),
+  );
+  withFacts.forEach((edge, index) => {
+    edge.factEmbedding = vectors[index] ?? null;
+  });
 }
 
 function entityTypesContext(): EntityTypeContext[] {
@@ -175,25 +216,28 @@ async function extractNodes(ai: Ai, episode: EpisodicNode, previousEpisodes: rea
 
 async function collectCandidateNodes(ai: Ai, store: Store, extracted: readonly EntityNode[]): Promise<EntityNode[][]> {
   const exactByName = new Map<string, EntityNode[]>();
-  for (const candidate of entitiesByNames(store, [...new Set(extracted.map((node) => node.name).filter((name) => name !== ""))])) {
+  const names = [...new Set(extracted.map((node) => node.name).filter((name) => name !== ""))].sort();
+  for (const candidate of names.length === 0 ? [] : entitiesByNames(store, names)) {
     const key = normalizeStringExact(candidate.name);
-    exactByName.set(key, [...(exactByName.get(key) ?? []), candidate]);
+    if (key !== "") {
+      exactByName.set(key, [...(exactByName.get(key) ?? []), candidate]);
+    }
   }
   const queryIndices = extracted.flatMap((node, index) => (node.name.replaceAll("\n", " ").trim() === "" ? [] : [index]));
-  const vectors = await createBatch(
-    ai,
-    queryIndices.map((index) => extracted[index]?.name.replaceAll("\n", " ") ?? ""),
-  );
+  const queries = queryIndices.map((index) => extracted[index]?.name.replaceAll("\n", " ") ?? "");
   const semantic = extracted.map((): EntityNode[] => []);
-  queryIndices.forEach((nodeIndex, queryIndex) => {
-    const vector = vectors[queryIndex];
-    const node = extracted[nodeIndex];
-    if (vector === undefined || node === undefined) {
-      return;
+  if (queries.length > 0) {
+    const vectors = await createBatch(ai, queries);
+    if (vectors.length !== queries.length) {
+      throw new Error(`embedder returned ${vectors.length} vectors for ${queries.length} queries`);
     }
-    node.nameEmbedding = vector;
-    semantic[nodeIndex] = nodeSimilaritySearch(store, vector, nodeDedupCandidateLimit, nodeDedupCosineMinScore);
-  });
+    queryIndices.forEach((nodeIndex, queryIndex) => {
+      const vector = vectors[queryIndex];
+      if (vector !== undefined) {
+        semantic[nodeIndex] = nodeSimilaritySearch(store, vector, nodeDedupCandidateLimit, nodeDedupCosineMinScore);
+      }
+    });
+  }
   return extracted.map((node, index) =>
     uniqueById([...(exactByName.get(normalizeStringExact(node.name)) ?? []), ...(semantic[index] ?? [])]),
   );
@@ -225,7 +269,7 @@ async function resolveWithLlm(
         candidate_id: candidateId,
         name: candidate.name,
         entity_types: candidate.labels,
-        summary: candidate.summary.slice(0, 120),
+        summary: [...candidate.summary].slice(0, dedupeCandidateSummaryChars).join(""),
       })),
       episodeContent: episode.content,
       previousEpisodes: previousEpisodeContext(previousEpisodes),
@@ -277,7 +321,7 @@ async function resolveExtractedNodes(
     uuidMap.set(node.id, match.id);
     return match;
   });
-  return { nodes: uniqueById(nodes), uuidMap };
+  return { nodes, uuidMap };
 }
 
 async function extractEdges(
@@ -408,9 +452,6 @@ async function extractEdgeTimestamps(ai: Ai, edge: EntityEdge, episode: Episodic
       parseTimestamp(timestamps.invalid_at) ?? edge.invalidAt,
     );
   } catch (error) {
-    if (isRateLimit(error)) {
-      throw error;
-    }
     console.warn(JSON.stringify({ event: "edge_timestamps_failed", edge: edge.id, error: String(error) }));
   }
 }
@@ -485,39 +526,42 @@ function dedupeWithinExtraction(edges: readonly EntityEdge[]): EntityEdge[] {
 
 async function resolveExtractedEdges(ai: Ai, store: Store, extracted: readonly EntityEdge[], episode: EpisodicNode, nowIso: string): Promise<ResolvedEdges> {
   const edges = dedupeWithinExtraction(extracted);
-  const vectors = await createBatch(
-    ai,
-    edges.map((edge) => edge.fact),
-  );
-  edges.forEach((edge, index) => {
-    edge.factEmbedding = vectors[index] ?? null;
-  });
+  await embedFacts(ai, edges);
   const config = searchRecipes.edge_hybrid_search_rrf;
-  const searches = await Promise.all(
-    edges.map(async (edge) => {
-      const queryVector = edge.factEmbedding ?? undefined;
+  const relatedResults = await semaphoreGather(
+    edges.map((edge) => () => {
       const pair = [edge.sourceId, edge.targetId];
-      const [related, invalidation] = await Promise.all([
-        search(ai, store, { query: edge.fact, config, filters: { edgeSourceNodeIds: pair, edgeTargetNodeIds: pair }, queryVector }),
-        search(ai, store, { query: edge.fact, config, queryVector }),
-      ]);
-      const samePair = related.edges.filter(
-        (candidate) =>
-          (candidate.sourceId === edge.sourceId && candidate.targetId === edge.targetId) ||
-          (candidate.sourceId === edge.targetId && candidate.targetId === edge.sourceId),
-      );
-      const relatedIds = new Set(samePair.map((candidate) => candidate.id));
-      return { related: samePair, existing: invalidation.edges.filter((candidate) => !relatedIds.has(candidate.id)) };
+      return search(ai, store, {
+        query: edge.fact,
+        config,
+        filters: { edgeSourceNodeIds: pair, edgeTargetNodeIds: pair },
+        queryVector: edge.factEmbedding ?? undefined,
+      });
     }),
   );
-  const deduped = await Promise.all(
-    edges.map((edge, index) => dedupeExtractedEdge(ai, edge, searches[index]?.related ?? [], searches[index]?.existing ?? [], episode)),
+  const relatedLists = edges.map((edge, index) =>
+    (relatedResults[index]?.edges ?? []).filter(
+      (candidate) =>
+        (candidate.sourceId === edge.sourceId && candidate.targetId === edge.targetId) ||
+        (candidate.sourceId === edge.targetId && candidate.targetId === edge.sourceId),
+    ),
+  );
+  const invalidationResults = await semaphoreGather(
+    edges.map((edge) => () => search(ai, store, { query: edge.fact, config, queryVector: edge.factEmbedding ?? undefined })),
+  );
+  const invalidationLists = edges.map((_, index) => {
+    const relatedIds = new Set((relatedLists[index] ?? []).map((candidate) => candidate.id));
+    return (invalidationResults[index]?.edges ?? []).filter((candidate) => !relatedIds.has(candidate.id));
+  });
+  const deduped = await semaphoreGather(
+    edges.map((edge, index) => () => dedupeExtractedEdge(ai, edge, relatedLists[index] ?? [], invalidationLists[index] ?? [], episode)),
   );
   const resolvedEdges = deduped.map((result) => result.resolved);
-  const newEdges = resolvedEdges.filter((resolved, index) => resolved === edges[index]);
+  const newEdges = resolvedEdges.filter((resolved, index) => resolved.id === edges[index]?.id);
   const invalidatedEdges = deduped.flatMap((result) =>
     result.candidates === null ? [] : applyTemporalInvalidation(result.resolved, result.candidates, nowIso),
   );
+  await Promise.all([embedFacts(ai, resolvedEdges), embedFacts(ai, invalidatedEdges)]);
   return { resolvedEdges, invalidatedEdges, newEdges };
 }
 
@@ -554,13 +598,26 @@ async function extractEntitySummaries(
   nodes: readonly EntityNode[],
   episode: EpisodicNode,
   previousEpisodes: readonly EpisodicNode[],
-  newEdges: readonly EntityEdge[],
+  edges: readonly EntityEdge[],
 ): Promise<void> {
+  const edgesByNode = new Map<string, EntityEdge[]>();
+  for (const edge of edges) {
+    for (const nodeId of [edge.sourceId, edge.targetId]) {
+      edgesByNode.set(nodeId, [...(edgesByNode.get(nodeId) ?? []), edge]);
+    }
+  }
   const needingLlm: EntityNode[] = [];
   for (const node of nodes) {
-    const facts = newEdges.filter((edge) => edge.sourceId === node.id || edge.targetId === node.id).map((edge) => edge.fact);
-    const summaryWithEdges = facts.length === 0 ? node.summary : `${node.summary}\n${facts.filter((fact) => fact !== "").join("\n")}`.trim();
-    if (summaryWithEdges !== "" && summaryWithEdges.length <= maxSummaryChars * 2) {
+    const nodeEdges = edgesByNode.get(node.id) ?? [];
+    let summaryWithEdges = node.summary;
+    if (nodeEdges.length > 0) {
+      const edgeFacts = nodeEdges
+        .filter((edge) => edge.fact !== "")
+        .map((edge) => edge.fact)
+        .join("\n");
+      summaryWithEdges = `${summaryWithEdges}\n${edgeFacts}`.trim();
+    }
+    if (summaryWithEdges !== "" && [...summaryWithEdges].length <= maxSummaryChars * 2) {
       node.summary = summaryWithEdges;
       continue;
     }
@@ -570,7 +627,7 @@ async function extractEntitySummaries(
   for (let start = 0; start < needingLlm.length; start += maxNodesPerSummaryCall) {
     flights.push(needingLlm.slice(start, start + maxNodesPerSummaryCall));
   }
-  await Promise.all(flights.map((flight) => summarizeFlight(ai, flight, episode.content, previousEpisodes, false)));
+  await semaphoreGather(flights.map((flight) => () => summarizeFlight(ai, flight, episode.content, previousEpisodes, false)));
 }
 
 function persistedEntityIds(store: Store, ids: readonly string[]): Set<string> {
@@ -589,32 +646,33 @@ export async function addEpisode(ai: Ai, store: Store, episode: EpisodicNode, no
   const { resolvedEdges, invalidatedEdges, newEdges } = await resolveExtractedEdges(ai, store, edges, episode, nowIso);
   const { nodes } = resolved;
   await extractEntitySummaries(ai, nodes, episode, previousEpisodes, newEdges);
+  const namedNodes = nodes.filter((node) => node.name !== "");
+  if (namedNodes.length > 0) {
+    const nameVectors = await createBatch(
+      ai,
+      namedNodes.map((node) => node.name),
+    );
+    namedNodes.forEach((node, index) => {
+      node.nameEmbedding = nameVectors[index] ?? null;
+    });
+  }
 
   const persisted = persistedEntityIds(
     store,
     nodes.map((node) => node.id),
   );
-  const unembedded = nodes.filter((node) => node.nameEmbedding === null && !persisted.has(node.id));
-  const nameVectors = await createBatch(
-    ai,
-    unembedded.map((node) => node.name),
-  );
-  unembedded.forEach((node, index) => {
-    node.nameEmbedding = nameVectors[index] ?? null;
-  });
-
   const entityEdges = [...resolvedEdges, ...invalidatedEdges];
   store.commit([
     ...nodes.map(saveEntity),
+    ...nodes.map((node) => saveMention(episode.id, node.id, nowIso)),
     ...entityEdges.flatMap(saveEdge),
-    ...nodes.map((node) => saveMention(episode.id, node.id)),
     ["UPDATE memories SET extracted_at = ? WHERE id = ?", nowIso, episode.id],
   ]);
 
   const newEdgeIds = new Set(newEdges.map((edge) => edge.id));
   return {
     episode: { id: episode.id, createdAt: episode.createdAt },
-    nodes: nodes.map((node) => ({ id: node.id, name: node.name, labels: node.labels, created: !persisted.has(node.id) })),
+    nodes: uniqueById(nodes).map((node) => ({ id: node.id, name: node.name, labels: node.labels, created: !persisted.has(node.id) })),
     edges: uniqueById(resolvedEdges).map((edge) => ({
       id: edge.id,
       sourceId: edge.sourceId,
@@ -661,7 +719,7 @@ export async function removeEpisode(ai: Ai, store: Store, episodeId: string): Pr
     )
     .map((row) => row.fact_id);
   const mentioned = store.all<{ entity_id: string; mentions: number }>(
-    "SELECT entity_id, (SELECT count(*) FROM episode_entities other WHERE other.entity_id = mention.entity_id) AS mentions " +
+    "SELECT DISTINCT entity_id, (SELECT count(*) FROM episode_entities other WHERE other.entity_id = mention.entity_id) AS mentions " +
       "FROM episode_entities mention WHERE memory_id = ?",
     episodeId,
   );
@@ -677,7 +735,7 @@ export async function removeEpisode(ai: Ai, store: Store, episodeId: string): Pr
     ["DELETE FROM jobs WHERE episode_id = ?", episodeId],
   ];
   store.commit(deletes);
-  await Promise.all(surviving.map((node) => rebuildNodeSummary(ai, store, node)));
+  await semaphoreGather(surviving.map((node) => () => rebuildNodeSummary(ai, store, node)));
   store.commit(surviving.map(saveEntity));
   return true;
 }

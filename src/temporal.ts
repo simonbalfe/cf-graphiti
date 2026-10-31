@@ -4,20 +4,51 @@ const futureAssertion =
   /\b(will|shall|is going to|are going to|going to|plans? to|planned to|planning to|intends? to|intended to|expects? to|expected to|promises? to|promised to|scheduled to|is scheduled to|are scheduled to|set to|aims? to|aimed to|committed to)\b|[a-z]+'ll\b/i;
 const deadline = /\b(by|before|no later than|deadline|due by|due on)\b/i;
 const ongoingStateEnd = /\b(until|through|thru|expires?|expired|ends?|ended|ending|stops?|stopped|ceases?|ceased|no longer)\b/i;
+const isoTimestamp =
+  /^(?:(\d{4})-(\d{2})-(\d{2})|(\d{4})(\d{2})(\d{2}))(?:[^\d](\d{2})(?::?(\d{2})(?::?(\d{2})(?:[.,](\d+))?)?)?(?:([+-])(\d{2})(?::?(\d{2})(?::?(\d{2})(?:\.\d+)?)?)?)?)?$/;
 
 function time(value: string | null): number | null {
   return value === null ? null : Date.parse(value);
 }
 
 export function parseTimestamp(value: string | null): string | null {
-  if (value === null || value.trim() === "") {
+  if (value === null || value === "") {
     return null;
   }
-  const text = value.trim().replace(/Z$/, "+00:00");
-  const hasZone = /(?:[+-]\d{2}:?\d{2})$/.test(text);
-  const hasTime = text.includes("T") || text.includes(" ");
-  const parsed = Date.parse(hasTime && !hasZone ? `${text.replace(" ", "T")}Z` : text);
-  return Number.isNaN(parsed) ? null : new Date(parsed).toISOString();
+  const match = isoTimestamp.exec(value.replaceAll("Z", "+00:00"));
+  if (match === null) {
+    return null;
+  }
+  const year = Number(match[1] ?? match[4]);
+  const month = Number(match[2] ?? match[5]);
+  const day = Number(match[3] ?? match[6]);
+  const hour = Number(match[7] ?? 0);
+  const minute = Number(match[8] ?? 0);
+  const second = Number(match[9] ?? 0);
+  const millisecond = Number((match[10] ?? "").slice(0, 3).padEnd(3, "0"));
+  const offsetHour = Number(match[12] ?? 0);
+  const offsetMinute = Number(match[13] ?? 0);
+  const offsetSecond = Number(match[14] ?? 0);
+  const daysInMonth = new Date(Date.UTC(2000, month, 0)).getUTCDate() - (month === 2 && !(year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0)) ? 1 : 0);
+  if (
+    year < 1 ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > daysInMonth ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59 ||
+    offsetHour > 23 ||
+    offsetMinute > 59 ||
+    offsetSecond > 59
+  ) {
+    return null;
+  }
+  const date = new Date(Date.UTC(2000, month - 1, day, hour, minute, second, millisecond));
+  date.setUTCFullYear(year);
+  const offset = (match[11] === "-" ? -1 : 1) * ((offsetHour * 60 + offsetMinute) * 60 + offsetSecond) * 1000;
+  return new Date(date.getTime() - offset).toISOString();
 }
 
 export function normalizeFutureTemporalBounds(

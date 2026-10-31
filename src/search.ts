@@ -7,6 +7,10 @@ const defaultSearchLimit = 10;
 const defaultMinScore = 0.6;
 const defaultMmrLambda = 0.5;
 const maxSearchDepth = 3;
+const pythonWhitespace = new Set([
+  0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x85, 0xa0, 0x1680, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006,
+  0x2007, 0x2008, 0x2009, 0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000,
+]);
 
 export type SearchMethod = "cosine_similarity" | "bm25" | "breadth_first_search";
 export type Reranker = "reciprocal_rank_fusion" | "node_distance" | "episode_mentions" | "mmr" | "cross_encoder";
@@ -238,48 +242,86 @@ function edgeSimilaritySearch(store: Store, vector: readonly number[], filters: 
   );
 }
 
-interface Traversal {
-  edgeIds: string[];
-  nodeIds: string[];
+interface Hop {
+  id: string;
+  targetId: string;
+  relatesTo: boolean;
 }
 
-function traverse(store: Store, origins: readonly string[], maxDepth: number, edgeLimit: number, nodeLimit: number, allowed?: ReadonlySet<string>): Traversal {
-  const edgeIds = new Set<string>();
-  const nodeIds = new Set<string>();
-  const expanded = new Set(origins);
-  let frontier = [...expanded];
-  for (let depth = 0; depth < maxDepth && frontier.length > 0; depth += 1) {
-    const relations = store.all<{ id: string; target_id: string }>(`SELECT id, target_id FROM facts WHERE source_id ${inIds}`, idList(frontier));
-    const mentions = store.all<{ entity_id: string }>(`SELECT entity_id FROM episode_entities WHERE memory_id ${inIds}`, idList(frontier));
-    const reached = [...relations.map((relation) => relation.target_id), ...mentions.map((mention) => mention.entity_id)];
-    for (const relation of relations) {
-      if (edgeIds.size < edgeLimit && (allowed === undefined || allowed.has(relation.id))) {
-        edgeIds.add(relation.id);
+function walkPaths(store: Store, origins: readonly string[], maxDepth: number, visit: (hop: Hop) => boolean): void {
+  const outgoing = new Map<string, Hop[]>();
+  const hopsFrom = (nodeId: string): Hop[] => {
+    const cached = outgoing.get(nodeId);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const relations = store
+      .all<{ id: string; target_id: string }>("SELECT id, target_id FROM facts WHERE source_id = ? ORDER BY rowid", nodeId)
+      .map((row): Hop => ({ id: row.id, targetId: row.target_id, relatesTo: true }));
+    const mentions = store
+      .all<{ id: string; entity_id: string }>("SELECT id, entity_id FROM episode_entities WHERE memory_id = ? ORDER BY rowid", nodeId)
+      .map((row): Hop => ({ id: row.id, targetId: row.entity_id, relatesTo: false }));
+    const hops = [...relations, ...mentions];
+    outgoing.set(nodeId, hops);
+    return hops;
+  };
+  const used = new Set<string>();
+  const expand = (nodeId: string, depth: number): boolean => {
+    for (const hop of hopsFrom(nodeId)) {
+      if (used.has(hop.id)) {
+        continue;
+      }
+      used.add(hop.id);
+      const stop = visit(hop) || (depth < maxDepth && expand(hop.targetId, depth + 1));
+      used.delete(hop.id);
+      if (stop) {
+        return true;
       }
     }
-    for (const id of reached) {
-      if (nodeIds.size < nodeLimit) {
-        nodeIds.add(id);
-      }
+    return false;
+  };
+  for (const origin of origins) {
+    if (expand(origin, 1)) {
+      return;
     }
-    frontier = reached.filter((id) => !expanded.has(id));
-    frontier.forEach((id) => expanded.add(id));
   }
-  return { edgeIds: [...edgeIds], nodeIds: [...nodeIds] };
 }
 
 function edgeBfsSearch(store: Store, origins: readonly string[], maxDepth: number, filters: SearchFilters, limit: number): EntityEdge[] {
   if (origins.length === 0) {
     return [];
   }
-  return edgesByIds(store, traverse(store, origins, maxDepth, limit, 0, allowedEdges(store, filters)).edgeIds);
+  const allowed = allowedEdges(store, filters);
+  const edgeIds = new Set<string>();
+  walkPaths(store, origins, maxDepth, (hop) => {
+    if (edgeIds.size >= limit) {
+      return true;
+    }
+    if (hop.relatesTo && (allowed === undefined || allowed.has(hop.id))) {
+      edgeIds.add(hop.id);
+    }
+    return false;
+  });
+  return edgesByIds(store, [...edgeIds]);
 }
 
 function nodeBfsSearch(store: Store, origins: readonly string[], maxDepth: number, limit: number): EntityNode[] {
   if (origins.length === 0 || maxDepth < 1) {
     return [];
   }
-  return entitiesByIds(store, traverse(store, origins, maxDepth, 0, limit).nodeIds);
+  const rows: string[] = [];
+  walkPaths(store, origins, maxDepth, (hop) => {
+    if (rows.length >= limit) {
+      return true;
+    }
+    rows.push(hop.targetId);
+    return false;
+  });
+  const nodeById = new Map(entitiesByIds(store, rows).map((node) => [node.id, node]));
+  return rows.flatMap((id) => {
+    const node = nodeById.get(id);
+    return node === undefined ? [] : [node];
+  });
 }
 
 function nodeFulltextSearch(store: Store, query: string, limit: number): EntityNode[] {
@@ -435,7 +477,7 @@ function needsQueryVector(config: SearchConfig): boolean {
 
 export async function search(ai: Ai, store: Store, request: SearchRequest): Promise<SearchResults> {
   const empty: SearchResults = { edges: [], edgeRerankerScores: [], nodes: [], nodeRerankerScores: [], episodes: [], episodeRerankerScores: [] };
-  if (request.query.trim() === "") {
+  if ([...request.query].every((char) => pythonWhitespace.has(char.codePointAt(0) ?? 0))) {
     return empty;
   }
   const { config } = request;
