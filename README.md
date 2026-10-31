@@ -102,7 +102,7 @@ There are three timestamps on a fact:
 | `invalid_at` | When it stopped being true |
 | `expired_at` | When the graph learned it was no longer current |
 
-`GET /graph` and `ohm-mem graph` hide facts with an `expired_at` unless you ask for them.
+`GET /graph` and `ohm-mem graph` hide facts with an `expired_at` unless you ask for them. Search does not filter them, matching Graphiti; check `expiredAt` on each result.
 
 ## Writing: `POST /remember`
 
@@ -157,7 +157,7 @@ flowchart TD
   E3["5. Resolve facts<br/>embed, hybrid-search the same entity pair and the whole graph,<br/>LLM marks duplicates and contradictions"] --> T
   T["6. Temporal invalidation<br/>older contradicted facts get invalid_at + expired_at"] --> S
   S["7. Update entity summaries<br/>append new facts; LLM rewrite once a summary passes the length cap"] --> W
-  W["8. Embed new entity names,<br/>commit entities, facts, mentions, extracted_at<br/>in one transaction"]
+  W["8. Re-embed every entity name and every saved fact,<br/>commit entities, facts, mentions, extracted_at<br/>in one transaction"]
 ```
 
 Steps 1, 2, 3, 5 and 7 call the LLM. Fact timestamps the LLM can't read from the episode text come from a separate timestamp prompt. For facts that state a future action ("will", "plans to", "scheduled to"), `src/temporal.ts` clamps `valid_at` to the episode time and ignores a deadline used as an end date.
@@ -171,7 +171,7 @@ Contradictions between facts are resolved by validity time. For example:
 
 ### Retries and rate limits
 
-Every Workers AI call goes through `runAi`: at most 3 concurrent calls per isolate, with rate-limit backoff of 2, 5, 12 and 25 seconds. When a structured response fails schema validation, the error goes back to the model, up to 2 more times.
+Every Workers AI call goes through `runAi`: at most 3 concurrent calls per isolate, with rate-limit backoff of 2, 5, 12 and 25 seconds. Timeouts, connection failures and 5xx errors are retried twice with exponential backoff. Before each call, input text is cleaned of zero-width characters, control characters and broken surrogates, as Graphiti's `_clean_input` does. Responses must match a strict JSON schema; when one doesn't, the error goes back to the model up to 2 more times. Refusals, exhausted rate-limit retries and transport failures are not retried this way.
 
 If extraction still fails, the episode stays stored and its row in `jobs` is rescheduled:
 
@@ -216,7 +216,7 @@ Facts, entities and episodes are searched in parallel. Each recipe picks the met
 
 `node_distance` recipes need `?center=<entity-id>`. `?origins=id,id` sets the BFS start points.
 
-Vector search is a brute-force scan over an in-memory cache, which fits one profile per Durable Object.
+Vector search is a brute-force scan over an in-memory cache, which fits one profile per Durable Object. Breadth-first search follows every path of 1 to 3 hops from each origin over facts and episode mentions, without reusing an edge, as Graphiti's Cypher query does.
 
 ## Forgetting
 
